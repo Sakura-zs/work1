@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# build
+dist/
+build/
+devel/
+
+# env
+.env
+.env.local
+.catkin_tools
+misc/
+tmp/
+
+# logs
+*.log
+logs/
+
+# system
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,9 @@
+<launch>
+  <node name="rvizvisualisation" pkg="rviz" type="rviz" output="log" args="-d $(find plan_manage)/config/traj.rviz" />
+  <node pkg="tf" type="static_transform_publisher" name="tf_53" args="0 0 0 0 0 0 world navigation 100" />
+  <node name="ssdvisualisation" pkg="rviz" type="rviz" output="log" args="-d $(find plan_manage)/config/ssd1.rviz" />
+  <node pkg="tf" type="static_transform_publisher" name="tf_52" args="0 0 0 0 0 0 world navigation 100" />
+  <node name="fitvisualisation" pkg="rviz" type="rviz" output="log" args="-d $(find plan_manage)/config/fit1.rviz" />
+  <node pkg="tf" type="static_transform_publisher" name="tf_51" args="0 0 0 0 0 0 world navigation 100" />
+</launch>
+
