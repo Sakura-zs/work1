@@ -1023,11 +1023,11 @@ void FrontierManager::updateHalfSpaces(vector<ClusterInfo::Ptr> &clusters) {
   }
 }
 
-inline bool FrontierManager::isInBox(const PointType &pt) {
+bool FrontierManager::isInBox(const PointType &pt) {
   return lidar_map_interface_->IsInBox(pt);
 }
 
-inline bool FrontierManager::isInBox(const Eigen::Vector3f &pt) {
+bool FrontierManager::isInBox(const Eigen::Vector3f &pt) {
   return lidar_map_interface_->IsInBox(pt);
 }
 

@@ -7,6 +7,7 @@
  * @Copyright (c) 2024 by ning-zelin, All Rights Reserved.
  */
 #include <frontier_manager/frontier_manager.h>
+#include <geometry_msgs/PoseArray.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <rosa/rosa_main.h>
@@ -479,14 +480,111 @@ static void postProcessSkeletonGraph(
                           graph.branches);
 }
 
+struct SupplementaryVpCandidate {
+  Eigen::Vector3f position = Eigen::Vector3f::Zero();
+  Eigen::Vector3f target = Eigen::Vector3f::Zero();
+  Eigen::Vector3f direction = Eigen::Vector3f::UnitX();
+  int subspace_id = -1;
+  float yaw = 0.0f;
+  double clearance = 0.0;
+};
+
+struct VoxelKey {
+  int x;
+  int y;
+  int z;
+
+  bool operator==(const VoxelKey &other) const {
+    return x == other.x && y == other.y && z == other.z;
+  }
+};
+
+struct VoxelKeyHash {
+  std::size_t operator()(const VoxelKey &key) const {
+    std::size_t seed = 0;
+    seed ^= std::hash<int>()(key.x) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    seed ^= std::hash<int>()(key.y) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    seed ^= std::hash<int>()(key.z) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+    return seed;
+  }
+};
+
+static VoxelKey makeVoxelKey(const Eigen::Vector3f &point, double voxel_size) {
+  const double safe_voxel = std::max(1e-3, voxel_size);
+  const double inv = 1.0 / safe_voxel;
+  return VoxelKey{static_cast<int>(std::floor(point.x() * inv)),
+                  static_cast<int>(std::floor(point.y() * inv)),
+                  static_cast<int>(std::floor(point.z() * inv))};
+}
+
+static Eigen::Matrix3d quatWxyzToRotation(const Eigen::Vector4d &quat_wxyz) {
+  Eigen::Quaterniond quat(quat_wxyz[0], quat_wxyz[1], quat_wxyz[2], quat_wxyz[3]);
+  if (quat.norm() < 1e-9) {
+    return Eigen::Matrix3d::Identity();
+  }
+  quat.normalize();
+  return quat.toRotationMatrix();
+}
+
+static Eigen::Vector3d normalFromFitAtPoint(const SubspaceFitResult &fit,
+                                            const Eigen::Vector3d &point) {
+  if (!fit.success) {
+    return Eigen::Vector3d::Zero();
+  }
+
+  if (fit.shape_type == "plane") {
+    const double norm = fit.plane.normal.norm();
+    if (norm < 1e-9) {
+      return Eigen::Vector3d::Zero();
+    }
+    return fit.plane.normal / norm;
+  }
+
+  if (fit.shape_type == "cylinder") {
+    Eigen::Vector3d axis = fit.cylinder.axis;
+    const double axis_norm = axis.norm();
+    if (axis_norm < 1e-9) {
+      return Eigen::Vector3d::Zero();
+    }
+    axis /= axis_norm;
+    Eigen::Vector3d radial = point - fit.cylinder.center;
+    radial -= radial.dot(axis) * axis;
+    const double radial_norm = radial.norm();
+    if (radial_norm < 1e-9) {
+      return Eigen::Vector3d::Zero();
+    }
+    return radial / radial_norm;
+  }
+
+  if (fit.shape_type == "box") {
+    const Eigen::Matrix3d rotation = quatWxyzToRotation(fit.box.quat_wxyz);
+    const Eigen::Vector3d half = 0.5 * fit.box.dims.cwiseMax(1e-6);
+    const Eigen::Vector3d local = rotation.transpose() * (point - fit.box.center);
+    const Eigen::Array3d ratio = local.array().abs() / half.array();
+
+    Eigen::Vector3d local_normal = Eigen::Vector3d::Zero();
+    int axis_idx = 0;
+    ratio.matrix().maxCoeff(&axis_idx);
+    local_normal(axis_idx) = (local(axis_idx) >= 0.0) ? 1.0 : -1.0;
+
+    Eigen::Vector3d world_normal = rotation * local_normal;
+    const double world_norm = world_normal.norm();
+    if (world_norm < 1e-9) {
+      return Eigen::Vector3d::Zero();
+    }
+    return world_normal / world_norm;
+  }
+
+  return Eigen::Vector3d::Zero();
+}
+
 } // namespace
 
 
 
 void FrontierManager::generateSupplementaryViewpoints(
     Eigen::Vector3f &center, vector<TopoNode::Ptr> &viewpoints) {
-  (void)viewpoints;
-  
+
   // 防止短时间内重复计算同一位置
   if ((ros::Time::now() - last_ssd_time_).toSec() < 2.0) {
     return;
@@ -681,9 +779,399 @@ void FrontierManager::generateSupplementaryViewpoints(
   nh_.param("frontier/rosa_fit_subspace_min_points_cylinder", fit_cfg.min_points_cylinder, 50);
   nh_.param("frontier/rosa_fit_subspace_min_points_box", fit_cfg.min_points_box, 20);
 
+  OverallFitGateConfig overall_gate_cfg;
+  nh_.param("frontier/rosa_fit_overall_gate_enable", overall_gate_cfg.enable, true);
+  nh_.param("frontier/rosa_fit_overall_gate_clamp_distance_m",
+            overall_gate_cfg.clamp_distance_m, 4.0);
+  nh_.param("frontier/rosa_fit_overall_gate_accept_threshold_m",
+            overall_gate_cfg.accept_threshold_m, 3.0);
+  nh_.param("frontier/rosa_fit_overall_gate_min_pred_points",
+            overall_gate_cfg.min_pred_points, 200);
+  nh_.param("frontier/rosa_fit_overall_gate_min_gt_points",
+            overall_gate_cfg.min_gt_points, 200);
+
+  bool supp_vp_enable;
+  bool supp_vp_bidirectional;
+  bool supp_vp_enable_z_constraint;
+  bool supp_vp_avoid_existing_viewpoints;
+  int supp_vp_sample_stride;
+  int supp_vp_min_subspace_points;
+  int supp_vp_max_per_subspace;
+  int supp_vp_max_total;
+  double supp_vp_dist;
+  double supp_vp_min_occ_clearance;
+  double supp_vp_safe_radius;
+  double supp_vp_safe_step;
+  double supp_vp_los_step;
+  double supp_vp_los_min_clearance;
+  double supp_vp_los_target_margin;
+  double supp_vp_dedup_voxel;
+  double supp_vp_target_cover_voxel;
+  double supp_vp_min_separation;
+  double supp_vp_ground_z;
+  double supp_vp_safe_height;
+  const int supp_default_max_per_subspace = std::max(24, subspace_topk * 5);
+  nh_.param("frontier/supp_vp_enable", supp_vp_enable, true);
+  nh_.param("frontier/supp_vp_bidirectional", supp_vp_bidirectional, false);
+  nh_.param("frontier/supp_vp_enable_z_constraint", supp_vp_enable_z_constraint, false);
+  nh_.param("frontier/supp_vp_avoid_existing_viewpoints", supp_vp_avoid_existing_viewpoints, false);
+  nh_.param("frontier/supp_vp_sample_stride", supp_vp_sample_stride, 6);
+  nh_.param("frontier/supp_vp_min_subspace_points", supp_vp_min_subspace_points, 10);
+  nh_.param("frontier/supp_vp_max_per_subspace", supp_vp_max_per_subspace, supp_default_max_per_subspace);
+  nh_.param("frontier/supp_vp_max_total", supp_vp_max_total, 300);
+  nh_.param("frontier/supp_vp_dist", supp_vp_dist, 1.5);
+  nh_.param("frontier/supp_vp_min_occ_clearance", supp_vp_min_occ_clearance, 0.45);
+  nh_.param("frontier/supp_vp_safe_radius", supp_vp_safe_radius, 0.25);
+  nh_.param("frontier/supp_vp_safe_step", supp_vp_safe_step, 0.15);
+  nh_.param("frontier/supp_vp_los_step", supp_vp_los_step, 0.15);
+  nh_.param("frontier/supp_vp_los_min_clearance", supp_vp_los_min_clearance, 0.2);
+  nh_.param("frontier/supp_vp_los_target_margin", supp_vp_los_target_margin, 0.1);
+  nh_.param("frontier/supp_vp_dedup_voxel", supp_vp_dedup_voxel, 0.30);
+  nh_.param("frontier/supp_vp_target_cover_voxel", supp_vp_target_cover_voxel, 0.40);
+  nh_.param("frontier/supp_vp_min_separation", supp_vp_min_separation, 0.25);
+  nh_.param("frontier/supp_vp_ground_z", supp_vp_ground_z, 0.0);
+  nh_.param("frontier/supp_vp_safe_height", supp_vp_safe_height, 1.0);
+
   std::vector<SubspaceFitResult> subspace_fit_results;
   if (fit_cfg.enable) {
     subspace_fit_results = SubspaceRansacFitter::FitAll(result.cloud.subspace_clouds, fit_cfg);
+
+    std::vector<Eigen::Vector3d> gate_gt_points;
+    size_t gt_total_points = 0;
+    for (const auto &subspace : result.cloud.subspace_clouds) {
+      gt_total_points += subspace.size();
+    }
+    gate_gt_points.reserve(gt_total_points);
+    for (const auto &subspace : result.cloud.subspace_clouds) {
+      gate_gt_points.insert(gate_gt_points.end(), subspace.begin(), subspace.end());
+    }
+
+    const auto overall_gate_result = SubspaceRansacFitter::EvaluateOverallHardThreshold(
+        subspace_fit_results, gate_gt_points, overall_gate_cfg);
+
+    if (overall_gate_cfg.enable) {
+      if (!overall_gate_result.evaluated) {
+        ROS_WARN("[FRONTIER] Overall fit gate skipped: pred=%d, gt=%d, min_pred=%d, min_gt=%d",
+                 overall_gate_result.pred_points, overall_gate_result.gt_points,
+                 overall_gate_cfg.min_pred_points, overall_gate_cfg.min_gt_points);
+      } else if (!overall_gate_result.accepted) {
+        ROS_WARN("[FRONTIER] Overall fit gate rejected: tmnd_bidir=%.4fm, pred_to_gt=%.4fm, gt_to_pred=%.4fm, threshold=%.4fm. Drop fitted models.",
+                 overall_gate_result.tmnd_bidir, overall_gate_result.tmnd_pred_to_gt,
+                 overall_gate_result.tmnd_gt_to_pred, overall_gate_cfg.accept_threshold_m);
+        subspace_fit_results.clear();
+      } else {
+        ROS_INFO("[FRONTIER] Overall fit gate accepted: tmnd_bidir=%.4fm, pred_to_gt=%.4fm, gt_to_pred=%.4fm, threshold=%.4fm",
+                 overall_gate_result.tmnd_bidir, overall_gate_result.tmnd_pred_to_gt,
+                 overall_gate_result.tmnd_gt_to_pred, overall_gate_cfg.accept_threshold_m);
+      }
+    }
+  }
+
+  std::vector<SupplementaryVpCandidate> appended_candidates;
+  size_t raw_vp_count = 0;
+  size_t safe_vp_count = 0;
+  size_t dedup_vp_count = 0;
+
+  if (supp_vp_enable && fit_cfg.enable && !subspace_fit_results.empty()) {
+    auto cubeSafetyCheck = [&](const Eigen::Vector3f &vp) {
+      const double radius = std::max(0.0, supp_vp_safe_radius);
+      if (radius < 1e-4) {
+        return true;
+      }
+
+      const double step = std::max(0.02, supp_vp_safe_step);
+      for (double dx = -radius; dx <= radius + 1e-6; dx += step) {
+        for (double dy = -radius; dy <= radius + 1e-6; dy += step) {
+          for (double dz = -radius; dz <= radius + 1e-6; dz += step) {
+            Eigen::Vector3f probe =
+                vp + Eigen::Vector3f(static_cast<float>(dx),
+                                     static_cast<float>(dy),
+                                     static_cast<float>(dz));
+            if (!isInBox(probe)) {
+              return false;
+            }
+            if (lidar_map_interface_->getDisToOcc(probe) < supp_vp_min_occ_clearance) {
+              return false;
+            }
+          }
+        }
+      }
+      return true;
+    };
+
+    auto losSafetyCheck = [&](const Eigen::Vector3f &vp,
+                              const Eigen::Vector3f &target_pt) {
+      Eigen::Vector3f ray = target_pt - vp;
+      const double ray_length = ray.norm();
+      if (ray_length < 1e-4) {
+        return false;
+      }
+      ray /= static_cast<float>(ray_length);
+
+      const double step = std::max(0.02, supp_vp_los_step);
+      const double target_margin = std::max(0.0, supp_vp_los_target_margin);
+      const double max_dist = std::max(0.0, ray_length - target_margin);
+
+      for (double dist = 0.0; dist <= max_dist + 1e-6; dist += step) {
+        Eigen::Vector3f probe = vp + static_cast<float>(dist) * ray;
+        if (!isInBox(probe)) {
+          return false;
+        }
+        if (lidar_map_interface_->getDisToOcc(probe) < supp_vp_los_min_clearance) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    std::unordered_map<VoxelKey, SupplementaryVpCandidate, VoxelKeyHash>
+        best_candidate_in_voxel;
+
+    const int sample_stride = std::max(1, supp_vp_sample_stride);
+    const int min_subspace_points = std::max(1, supp_vp_min_subspace_points);
+    const int max_per_subspace = std::max(1, supp_vp_max_per_subspace);
+
+    for (const auto &fit : subspace_fit_results) {
+      if (!fit.success) {
+        continue;
+      }
+      if (fit.subspace_id < 0 ||
+          fit.subspace_id >= static_cast<int>(result.cloud.subspace_clouds.size())) {
+        continue;
+      }
+
+      const auto &subspace_points = result.cloud.subspace_clouds[fit.subspace_id];
+      if (static_cast<int>(subspace_points.size()) < min_subspace_points) {
+        continue;
+      }
+
+      std::vector<SupplementaryVpCandidate> subspace_candidates;
+      for (int point_idx = 0;
+           point_idx < static_cast<int>(subspace_points.size());
+           point_idx += sample_stride) {
+        const Eigen::Vector3d source_pt_d = subspace_points[point_idx];
+        const Eigen::Vector3d normal_d = normalFromFitAtPoint(fit, source_pt_d);
+        if (normal_d.norm() < 1e-6) {
+          continue;
+        }
+
+        const int sign_count = supp_vp_bidirectional ? 2 : 1;
+        for (int sign_idx = 0; sign_idx < sign_count; ++sign_idx) {
+          const double sign = (sign_idx == 0) ? 1.0 : -1.0;
+          Eigen::Vector3f source_pt = source_pt_d.cast<float>();
+          Eigen::Vector3f normal = (sign * normal_d).cast<float>();
+          if (normal.norm() < 1e-6f) {
+            continue;
+          }
+          normal.normalize();
+
+          Eigen::Vector3f vp = source_pt + static_cast<float>(supp_vp_dist) * normal;
+          if (supp_vp_enable_z_constraint) {
+            const float min_safe_z = static_cast<float>(supp_vp_ground_z + supp_vp_safe_height);
+            if (vp.z() < min_safe_z) {
+              vp.z() = min_safe_z;
+            }
+          }
+
+          raw_vp_count++;
+          if (!isInBox(vp)) {
+            continue;
+          }
+          const double clearance = lidar_map_interface_->getDisToOcc(vp);
+          if (clearance < supp_vp_min_occ_clearance) {
+            continue;
+          }
+          if (!cubeSafetyCheck(vp)) {
+            continue;
+          }
+          if (!losSafetyCheck(vp, source_pt)) {
+            continue;
+          }
+
+          const Eigen::Vector3f look_vec = source_pt - vp;
+          if (std::hypot(look_vec.x(), look_vec.y()) < 1e-4) {
+            continue;
+          }
+
+          SupplementaryVpCandidate candidate;
+          candidate.position = vp;
+          candidate.target = source_pt;
+          candidate.direction = look_vec.normalized();
+          candidate.subspace_id = fit.subspace_id;
+          candidate.yaw = std::atan2(look_vec.y(), look_vec.x());
+          candidate.clearance = clearance;
+          subspace_candidates.push_back(candidate);
+          safe_vp_count++;
+        }
+      }
+
+      // Coverage-first selection in each subspace: keep one best candidate for each target voxel.
+      std::unordered_map<VoxelKey, SupplementaryVpCandidate, VoxelKeyHash>
+          best_candidate_in_target_voxel;
+      for (const auto &candidate : subspace_candidates) {
+        const VoxelKey target_key =
+            makeVoxelKey(candidate.target, supp_vp_target_cover_voxel);
+        auto it = best_candidate_in_target_voxel.find(target_key);
+        if (it == best_candidate_in_target_voxel.end() ||
+            candidate.clearance > it->second.clearance) {
+          best_candidate_in_target_voxel[target_key] = candidate;
+        }
+      }
+      std::vector<SupplementaryVpCandidate> covered_candidates;
+      covered_candidates.reserve(best_candidate_in_target_voxel.size());
+      for (const auto &entry : best_candidate_in_target_voxel) {
+        covered_candidates.push_back(entry.second);
+      }
+      subspace_candidates.swap(covered_candidates);
+
+      std::sort(subspace_candidates.begin(), subspace_candidates.end(),
+                [](const SupplementaryVpCandidate &a,
+                   const SupplementaryVpCandidate &b) {
+                  return a.clearance > b.clearance;
+                });
+      if (static_cast<int>(subspace_candidates.size()) > max_per_subspace) {
+        subspace_candidates.resize(max_per_subspace);
+      }
+
+      for (const auto &candidate : subspace_candidates) {
+        const VoxelKey key = makeVoxelKey(candidate.position, supp_vp_dedup_voxel);
+        auto it = best_candidate_in_voxel.find(key);
+        if (it == best_candidate_in_voxel.end() ||
+            candidate.clearance > it->second.clearance) {
+          best_candidate_in_voxel[key] = candidate;
+        }
+      }
+    }
+
+    dedup_vp_count = best_candidate_in_voxel.size();
+    std::vector<SupplementaryVpCandidate> ranked_candidates;
+    ranked_candidates.reserve(best_candidate_in_voxel.size());
+    for (const auto &entry : best_candidate_in_voxel) {
+      ranked_candidates.push_back(entry.second);
+    }
+
+    std::sort(ranked_candidates.begin(), ranked_candidates.end(),
+              [](const SupplementaryVpCandidate &a,
+                 const SupplementaryVpCandidate &b) {
+                return a.clearance > b.clearance;
+              });
+    if (supp_vp_max_total > 0 &&
+        static_cast<int>(ranked_candidates.size()) > supp_vp_max_total) {
+      ranked_candidates.resize(supp_vp_max_total);
+    }
+
+    std::vector<Eigen::Vector3f> accepted_positions;
+    if (supp_vp_avoid_existing_viewpoints) {
+      accepted_positions.reserve(viewpoints.size() + ranked_candidates.size());
+      for (const auto &existing_vp : viewpoints) {
+        if (!existing_vp) {
+          continue;
+        }
+        accepted_positions.push_back(existing_vp->center_);
+      }
+    } else {
+      accepted_positions.reserve(ranked_candidates.size());
+    }
+
+    for (const auto &candidate : ranked_candidates) {
+      bool too_close = false;
+      for (const auto &accepted_pos : accepted_positions) {
+        if ((accepted_pos - candidate.position).norm() < supp_vp_min_separation) {
+          too_close = true;
+          break;
+        }
+      }
+      if (too_close) {
+        continue;
+      }
+
+      TopoNode::Ptr vp_node = make_shared<TopoNode>();
+      vp_node->is_viewpoint_ = true;
+      vp_node->center_ = candidate.position;
+      vp_node->yaw_ = candidate.yaw;
+      viewpoints.push_back(vp_node);
+      appended_candidates.push_back(candidate);
+      accepted_positions.push_back(candidate.position);
+    }
+  }
+
+  static ros::Publisher supplementary_vp_pose_pub =
+      nh_.advertise<geometry_msgs::PoseArray>("/frontier/supplementary_viewpoints", 1, true);
+  static ros::Publisher supplementary_vp_marker_pub =
+      nh_.advertise<visualization_msgs::MarkerArray>("/frontier/supplementary_viewpoints_markers", 1, true);
+
+  geometry_msgs::PoseArray vp_pose_array;
+  vp_pose_array.header.frame_id = "world";
+  vp_pose_array.header.stamp = ros::Time::now();
+
+  visualization_msgs::MarkerArray vp_marker_array;
+  visualization_msgs::Marker clear_marker;
+  clear_marker.header = vp_pose_array.header;
+  clear_marker.action = visualization_msgs::Marker::DELETEALL;
+  vp_marker_array.markers.push_back(clear_marker);
+
+  visualization_msgs::Marker vp_points_marker;
+  vp_points_marker.header = vp_pose_array.header;
+  vp_points_marker.ns = "supplementary_vp_points";
+  vp_points_marker.id = 0;
+  vp_points_marker.type = visualization_msgs::Marker::SPHERE_LIST;
+  vp_points_marker.action = visualization_msgs::Marker::ADD;
+  vp_points_marker.pose.orientation.w = 1.0;
+  vp_points_marker.scale.x = 0.25;
+  vp_points_marker.scale.y = 0.25;
+  vp_points_marker.scale.z = 0.25;
+  vp_points_marker.color.r = 0.95;
+  vp_points_marker.color.g = 0.65;
+  vp_points_marker.color.b = 0.15;
+  vp_points_marker.color.a = 0.95;
+
+  visualization_msgs::Marker vp_dirs_marker;
+  vp_dirs_marker.header = vp_pose_array.header;
+  vp_dirs_marker.ns = "supplementary_vp_dirs";
+  vp_dirs_marker.id = 1;
+  vp_dirs_marker.type = visualization_msgs::Marker::LINE_LIST;
+  vp_dirs_marker.action = visualization_msgs::Marker::ADD;
+  vp_dirs_marker.pose.orientation.w = 1.0;
+  vp_dirs_marker.scale.x = 0.04;
+  vp_dirs_marker.color.r = 0.15;
+  vp_dirs_marker.color.g = 0.85;
+  vp_dirs_marker.color.b = 0.95;
+  vp_dirs_marker.color.a = 0.95;
+
+  for (const auto &candidate : appended_candidates) {
+    geometry_msgs::Pose pose;
+    pose.position.x = candidate.position.x();
+    pose.position.y = candidate.position.y();
+    pose.position.z = candidate.position.z();
+    Eigen::Quaternionf q(Eigen::AngleAxisf(candidate.yaw, Eigen::Vector3f::UnitZ()));
+    pose.orientation.w = q.w();
+    pose.orientation.x = q.x();
+    pose.orientation.y = q.y();
+    pose.orientation.z = q.z();
+    vp_pose_array.poses.push_back(pose);
+
+    geometry_msgs::Point p_vp;
+    p_vp.x = candidate.position.x();
+    p_vp.y = candidate.position.y();
+    p_vp.z = candidate.position.z();
+    vp_points_marker.points.push_back(p_vp);
+
+    geometry_msgs::Point p_target;
+    p_target.x = candidate.target.x();
+    p_target.y = candidate.target.y();
+    p_target.z = candidate.target.z();
+    vp_dirs_marker.points.push_back(p_vp);
+    vp_dirs_marker.points.push_back(p_target);
+  }
+
+  vp_marker_array.markers.push_back(vp_points_marker);
+  vp_marker_array.markers.push_back(vp_dirs_marker);
+  supplementary_vp_pose_pub.publish(vp_pose_array);
+  supplementary_vp_marker_pub.publish(vp_marker_array);
+
+  if (supp_vp_enable) {
+    ROS_INFO("[FRONTIER] Supplementary viewpoint generation: raw=%zu, safe=%zu, dedup=%zu, appended=%zu",
+             raw_vp_count, safe_vp_count, dedup_vp_count, appended_candidates.size());
   }
 
   supplementary_ssd_cache_.valid = true;
