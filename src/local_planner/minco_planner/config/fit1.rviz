@@ -145,7 +145,16 @@ Visualization Manager:
       Marker Topic: /frontier/supplementary_viewpoints_markers
       Name: MarkerArray
       Namespaces:
-        supplementary_viewpoints: true
+        supplementary_vp_dirs: true
+        supplementary_vp_points: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /frontier/supplementary_normals_markers
+      Name: MarkerArray
+      Namespaces:
+        supplementary_normals: true
       Queue Size: 100
       Value: true
   Enabled: true
@@ -192,9 +201,9 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.3947974443435669
+      Pitch: 0.19020232558250427
       Target Frame: <Fixed Frame>
-      Yaw: 2.0272793769836426
+      Yaw: 2.092292547225952
     Saved: ~
 Window Geometry:
   Displays:
@@ -213,4 +222,4 @@ Window Geometry:
     collapsed: true
   Width: 1917
   X: 1591
-  Y: 74
+  Y: 0
