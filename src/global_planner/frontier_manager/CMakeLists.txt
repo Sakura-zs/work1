@@ -18,13 +18,16 @@ find_package(catkin REQUIRED COMPONENTS
     lidar_map
     pointcloud_topo
     rosa
+    plan_env
+    active_perception
+    viewpoint_manager
 )
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS segmentation)
 catkin_package(
     INCLUDE_DIRS include
     LIBRARIES frontier_manager
-    CATKIN_DEPENDS roscpp std_msgs lidar_map pointcloud_topo rosa
+    CATKIN_DEPENDS roscpp std_msgs lidar_map pointcloud_topo rosa plan_env active_perception viewpoint_manager
 
 )
 include_directories(

@@ -54,7 +54,7 @@ ROSA_main rosa;
 rosa.init(nh);
 rosa.main();
 
-predrecon::SsdExportData out = predrecon::SsdResultAdapter::Convert(rosa.P);
+fast_planner::SsdExportData out = fast_planner::SsdResultAdapter::Convert(rosa.P);
 ```
 
 `SsdExportData` contains:

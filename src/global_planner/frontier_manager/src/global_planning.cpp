@@ -12,6 +12,7 @@
 #include <pcl/io/pcd_io.h>
 #include <rosa/rosa_main.h>
 #include <rosa/ssd_adapter.h>
+#include <viewpoint_manager/viewpoint_manager.h>
 
 #include <chrono>
 #include <cmath>
@@ -804,6 +805,7 @@ void FrontierManager::generateSupplementaryViewpoints(
   bool supp_vp_enable_visibility_eval;
   bool supp_vp_enable_coverage_stop;
   bool supp_vp_enable_yaw_diversity;
+  bool supp_vp_use_viewpoint_manager;
   bool supp_vp_publish_normals;
   bool supp_vp_publish_sampled_only;
   bool supp_vp_report_filter_stats;
@@ -835,10 +837,13 @@ void FrontierManager::generateSupplementaryViewpoints(
   double supp_vp_normal_vis_scale;
   double supp_vp_ground_z;
   double supp_vp_safe_height;
+  std::string supp_vp_backend_mode;
   const int supp_default_max_per_subspace = std::max(80, subspace_topk * 20);
   nh_.param("frontier/supp_vp_enable", supp_vp_enable, true);
   nh_.param("frontier/supp_vp_bidirectional", supp_vp_bidirectional, true);
   nh_.param("frontier/supp_vp_best_of_two_sides", supp_vp_best_of_two_sides, true);
+  nh_.param("frontier/supp_vp_use_viewpoint_manager", supp_vp_use_viewpoint_manager, true);
+  nh_.param("frontier/supp_vp_backend_mode", supp_vp_backend_mode, std::string("legacy"));
   nh_.param("frontier/supp_vp_enable_z_constraint", supp_vp_enable_z_constraint, false);
   nh_.param("frontier/supp_vp_avoid_existing_viewpoints", supp_vp_avoid_existing_viewpoints, false);
   nh_.param("frontier/supp_vp_enable_los_check", supp_vp_enable_los_check, true);
@@ -880,6 +885,20 @@ void FrontierManager::generateSupplementaryViewpoints(
   nh_.param("frontier/supp_vp_normal_vis_scale", supp_vp_normal_vis_scale, 0.6);
   nh_.param("frontier/supp_vp_ground_z", supp_vp_ground_z, 0.0);
   nh_.param("frontier/supp_vp_safe_height", supp_vp_safe_height, 1.0);
+
+  bool use_vp_manager_backend = supp_vp_use_viewpoint_manager;
+  if (!supp_vp_use_viewpoint_manager) {
+    if (supp_vp_backend_mode == "vp_manager") {
+      use_vp_manager_backend = true;
+    } else if (supp_vp_backend_mode == "legacy") {
+      use_vp_manager_backend = false;
+    } else {
+      ROS_WARN("[FRONTIER] Unknown supplementary VP backend mode '%s', fallback to legacy.",
+               supp_vp_backend_mode.c_str());
+      use_vp_manager_backend = false;
+    }
+  }
+  const std::string supp_vp_backend_name = use_vp_manager_backend ? "vp_manager" : "legacy";
 
   std::vector<SubspaceFitResult> subspace_fit_results;
   if (fit_cfg.enable) {
@@ -991,7 +1010,260 @@ void FrontierManager::generateSupplementaryViewpoints(
     const int normal_vis_stride = std::max(1, supp_vp_normal_vis_sample_stride);
     const int normal_vis_max_count = std::max(0, supp_vp_normal_vis_max_count);
 
-    if (supp_vp_publish_sampled_only) {
+    if (use_vp_manager_backend) {
+      set_default_if_unset("viewpoint_manager/visible_range",
+                           std::max(2.0, supp_vp_visibility_radius));
+      set_default_if_unset("viewpoint_manager/viewpoints_distance", supp_vp_dist);
+      set_default_if_unset("viewpoint_manager/fov_h", 90.0);
+      set_default_if_unset("viewpoint_manager/fov_w", 120.0);
+      set_default_if_unset("viewpoint_manager/pitch_upper", 30.0);
+      set_default_if_unset("viewpoint_manager/pitch_lower", -30.0);
+      set_default_if_unset("viewpoint_manager/zGround", supp_vp_enable_z_constraint);
+      set_default_if_unset("viewpoint_manager/GroundPos", supp_vp_ground_z);
+      set_default_if_unset("viewpoint_manager/safeHeight", supp_vp_safe_height);
+      set_default_if_unset("viewpoint_manager/safe_radius", supp_vp_safe_radius);
+      set_default_if_unset("viewpoint_manager/attitude_type", std::string("all"));
+      set_default_if_unset("viewpoint_manager/max_iter_num", 2);
+      set_default_if_unset("viewpoint_manager/pose_update", true);
+
+      pcl::PointCloud<pcl::PointXYZ>::Ptr map_cloud_for_vm(
+          new pcl::PointCloud<pcl::PointXYZ>(*local_cloud));
+      pcl::PointCloud<pcl::PointXYZ>::Ptr model_cloud_for_vm(
+          new pcl::PointCloud<pcl::PointXYZ>);
+      std::map<Eigen::Vector3d, Eigen::Vector3d, Vector3dCompare0>
+          normals_for_vm;
+      pcl::PointCloud<pcl::PointNormal>::Ptr init_vps_for_vm(
+          new pcl::PointCloud<pcl::PointNormal>);
+
+      auto append_init_candidate =
+          [&](const SupplementaryVpCandidate &candidate) {
+            pcl::PointNormal vp;
+            vp.x = candidate.position.x();
+            vp.y = candidate.position.y();
+            vp.z = candidate.position.z();
+            vp.normal_x = candidate.direction.x();
+            vp.normal_y = candidate.direction.y();
+            vp.normal_z = candidate.direction.z();
+            init_vps_for_vm->points.push_back(vp);
+            safe_vp_count++;
+          };
+
+      for (const auto &fit : subspace_fit_results) {
+        if (!fit.success || fit.subspace_id < 0) {
+          continue;
+        }
+
+        const auto &fit_model_points = fit.model_cloud;
+        for (int point_idx = 0;
+             point_idx < static_cast<int>(fit_model_points.size());
+             point_idx += sample_stride) {
+          const Eigen::Vector3d source_pt_d = fit_model_points[point_idx];
+          const Eigen::Vector3d normal_d = normalFromFitAtPoint(fit, source_pt_d);
+          if (normal_d.norm() < 1e-6) {
+            continue;
+          }
+
+          const Eigen::Vector3f source_pt = source_pt_d.cast<float>();
+          if (!isInBox(source_pt)) {
+            continue;
+          }
+
+          pcl::PointXYZ model_pt;
+          model_pt.x = source_pt.x();
+          model_pt.y = source_pt.y();
+          model_pt.z = source_pt.z();
+          model_cloud_for_vm->points.push_back(model_pt);
+
+          const Eigen::Vector3d model_key(static_cast<double>(model_pt.x),
+                                          static_cast<double>(model_pt.y),
+                                          static_cast<double>(model_pt.z));
+          normals_for_vm[model_key] = normal_d.normalized();
+
+          if (supp_vp_publish_normals) {
+            ++normal_raw_count;
+            if ((normal_vis_max_count <= 0 ||
+                 static_cast<int>(normal_vis_origins.size()) < normal_vis_max_count) &&
+                ((normal_raw_count - 1) % static_cast<size_t>(normal_vis_stride) == 0)) {
+              normal_vis_origins.push_back(source_pt);
+              normal_vis_dirs.push_back(normal_d.cast<float>().normalized());
+            }
+          }
+
+          std::vector<SupplementaryVpCandidate> directional_candidates;
+          const int sign_count =
+              (supp_vp_bidirectional || supp_vp_best_of_two_sides) ? 2 : 1;
+          directional_candidates.reserve(sign_count);
+
+          for (int sign_idx = 0; sign_idx < sign_count; ++sign_idx) {
+            raw_vp_count++;
+            const double sign = (sign_idx == 0) ? 1.0 : -1.0;
+            Eigen::Vector3f normal = (sign * normal_d).cast<float>();
+            if (normal.norm() < 1e-6f) {
+              continue;
+            }
+            normal.normalize();
+
+            Eigen::Vector3f vp =
+                source_pt + static_cast<float>(supp_vp_dist) * normal;
+            if (supp_vp_enable_z_constraint) {
+              const float min_safe_z =
+                  static_cast<float>(supp_vp_ground_z + supp_vp_safe_height);
+              if (vp.z() < min_safe_z) {
+                vp.z() = min_safe_z;
+              }
+            }
+
+            if (!isInBox(vp)) {
+              continue;
+            }
+            const double clearance = lidar_map_interface_->getDisToOcc(vp);
+            if (clearance < supp_vp_min_occ_clearance) {
+              continue;
+            }
+            if (!cubeSafetyCheck(vp) || !losSafetyCheck(vp, source_pt)) {
+              continue;
+            }
+
+            const Eigen::Vector3f look_vec = source_pt - vp;
+            if (look_vec.norm() < 1e-4f) {
+              continue;
+            }
+
+            SupplementaryVpCandidate candidate;
+            candidate.position = vp;
+            candidate.target = source_pt;
+            candidate.direction = look_vec.normalized();
+            candidate.subspace_id = fit.subspace_id;
+            candidate.yaw = std::atan2(candidate.direction.y(), candidate.direction.x());
+            candidate.clearance = clearance;
+            directional_candidates.push_back(candidate);
+          }
+
+          if (directional_candidates.empty()) {
+            continue;
+          }
+
+          if (supp_vp_bidirectional) {
+            for (const auto &candidate : directional_candidates) {
+              append_init_candidate(candidate);
+            }
+          } else {
+            const auto best_it = std::max_element(
+                directional_candidates.begin(), directional_candidates.end(),
+                [](const SupplementaryVpCandidate &a,
+                   const SupplementaryVpCandidate &b) {
+                  return a.clearance < b.clearance;
+                });
+            append_init_candidate(*best_it);
+          }
+        }
+      }
+
+      model_cloud_for_vm->width = model_cloud_for_vm->points.size();
+      model_cloud_for_vm->height = 1;
+      model_cloud_for_vm->is_dense = true;
+
+      if (!model_cloud_for_vm->points.empty() && !normals_for_vm.empty()) {
+        ROS_INFO("[FRONTIER] VP manager backend start: model=%zu, normals=%zu, init_vps=%zu",
+                 model_cloud_for_vm->points.size(), normals_for_vm.size(),
+                 init_vps_for_vm->points.size());
+
+        std::vector<SingleViewpoint> updated_vps;
+        try {
+          ViewpointManager vp_manager;
+          vp_manager.init(nh_);
+          vp_manager.reset();
+          vp_manager.setMapPointCloud(map_cloud_for_vm);
+          vp_manager.setModel(model_cloud_for_vm);
+          vp_manager.setNormals(normals_for_vm);
+          if (!init_vps_for_vm->points.empty()) {
+            vp_manager.setInitViewpoints(init_vps_for_vm);
+          }
+
+          vp_manager.updateViewpoints();
+          vp_manager.getUpdatedViewpoints(updated_vps);
+          dedup_vp_count = updated_vps.size();
+          ROS_INFO("[FRONTIER] VP manager backend success: updated_vps=%zu",
+                   updated_vps.size());
+        } catch (const std::exception &e) {
+          ROS_ERROR("[FRONTIER] VP manager backend exception: %s", e.what());
+          updated_vps.clear();
+          dedup_vp_count = 0;
+        } catch (...) {
+          ROS_ERROR("[FRONTIER] VP manager backend exception: unknown");
+          updated_vps.clear();
+          dedup_vp_count = 0;
+        }
+
+        std::vector<Eigen::Vector3f> accepted_positions;
+        if (supp_vp_avoid_existing_viewpoints) {
+          accepted_positions.reserve(viewpoints.size() + updated_vps.size());
+          for (const auto &existing_vp : viewpoints) {
+            if (!existing_vp) {
+              continue;
+            }
+            accepted_positions.push_back(existing_vp->center_);
+          }
+        }
+
+        for (const auto &updated_vp : updated_vps) {
+          if (updated_vp.pose.size() < 5) {
+            continue;
+          }
+
+          SupplementaryVpCandidate candidate;
+          candidate.position =
+              Eigen::Vector3f(static_cast<float>(updated_vp.pose(0)),
+                              static_cast<float>(updated_vp.pose(1)),
+                              static_cast<float>(updated_vp.pose(2)));
+          const float pitch = static_cast<float>(updated_vp.pose(3));
+          const float yaw = static_cast<float>(updated_vp.pose(4));
+
+          Eigen::Vector3f direction(std::cos(pitch) * std::cos(yaw),
+                                    std::cos(pitch) * std::sin(yaw),
+                                    std::sin(pitch));
+          if (direction.norm() < 1e-6f) {
+            direction = Eigen::Vector3f::UnitX();
+          } else {
+            direction.normalize();
+          }
+
+          candidate.direction = direction;
+          candidate.target =
+              candidate.position + static_cast<float>(supp_vp_dist) * direction;
+          candidate.subspace_id = -1;
+          candidate.yaw = yaw;
+          candidate.clearance =
+              lidar_map_interface_->getDisToOcc(candidate.position);
+
+          bool too_close = false;
+          if (supp_vp_enable_min_separation && supp_vp_min_separation > 1e-4) {
+            for (const auto &accepted_pos : accepted_positions) {
+              if ((accepted_pos - candidate.position).norm() <
+                  supp_vp_min_separation) {
+                too_close = true;
+                break;
+              }
+            }
+          }
+          if (too_close) {
+            continue;
+          }
+
+          TopoNode::Ptr vp_node = make_shared<TopoNode>();
+          vp_node->is_viewpoint_ = true;
+          vp_node->center_ = candidate.position;
+          vp_node->yaw_ = candidate.yaw;
+          viewpoints.push_back(vp_node);
+
+          appended_candidates.push_back(candidate);
+          accepted_positions.push_back(candidate.position);
+        }
+      } else {
+        ROS_WARN("[FRONTIER] VP manager backend skipped: model=%zu, normals=%zu",
+                 model_cloud_for_vm->points.size(), normals_for_vm.size());
+      }
+    } else if (supp_vp_publish_sampled_only) {
       for (const auto &fit : subspace_fit_results) {
         if (!fit.success || fit.subspace_id < 0) {
           continue;
@@ -1700,7 +1972,8 @@ void FrontierManager::generateSupplementaryViewpoints(
   supplementary_normal_marker_pub.publish(normal_marker_array);
 
   if (supp_vp_enable) {
-    ROS_INFO("[FRONTIER] Supplementary viewpoint generation: raw=%zu, safe=%zu, dedup=%zu, appended=%zu, normals=%zu/%zu, sampled_only=%d, filter_upto=%d, bidir=%d, best2side=%d, rr=%d, target_cover=%d",
+      ROS_INFO("[FRONTIER] Supplementary viewpoint generation: backend=%s, raw=%zu, safe=%zu, dedup=%zu, appended=%zu, normals=%zu/%zu, sampled_only=%d, filter_upto=%d, bidir=%d, best2side=%d, rr=%d, target_cover=%d",
+       supp_vp_backend_name.c_str(),
              raw_vp_count, safe_vp_count, dedup_vp_count, appended_candidates.size(),
              normal_vis_origins.size(), normal_raw_count,
        supp_vp_publish_sampled_only, supp_vp_filter_upto_stage,
@@ -1737,8 +2010,8 @@ void FrontierManager::generateSupplementaryViewpoints(
              stage_removed_final[4], stage_removed_final[5], stage_removed_final[6],
              stage_removed_final[7], stage_removed_final[8]);
     if (!stage_removed_valid) {
-      ROS_INFO("[FRONTIER][VP_FILTER] final_stage_removed is zero-filled because filtering stages were not executed (sampled_only=%d).",
-               supp_vp_publish_sampled_only);
+      ROS_INFO("[FRONTIER][VP_FILTER] final_stage_removed is zero-filled because legacy stage filters were not executed (backend=%s, sampled_only=%d).",
+               supp_vp_backend_name.c_str(), supp_vp_publish_sampled_only);
     }
   }
 }
